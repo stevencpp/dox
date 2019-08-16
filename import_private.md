@@ -22,28 +22,29 @@ export {
 struct A3 {};
 ```
 
-Suppose we want to use struct `A1` in a struct `B1` in a module `B` whose ABI should remain stable even if the layout of `A1` changes. We could just `import A;` in `B` and use a pointer to `A1` but suppose we also want to completely isolate users of `B1` from the internals of `A1`, either because of Hyrum's law (even if we make the pointer a private member it may still be observable through reflection or other tricks), because those internals might need to remain secret, because doing so could provide build isolation for faster incremental builds (`B`'s BMI should not depend on `A`'s BMI), or because in this case `A` is slow to parse and we'd like to lower the rebuild latency for debug builds. We could use PIMPL but the problem is that forward declaring `A1` outside of module `A` is not allowed, and we can't convert `A` into a partition of `B` because we're not allowed to change the file that contains `A`. The proposed `import private` directive would allow the forward declaration while making it clear which module `A1` belongs to. At the same time the proposal would allow using `A1`'s definition inside non-inline functions in `B` so that we don't need to repeat the declarations of the members of `B1` in either an implementation unit or a `module :private` section:
+Suppose we want to use struct `A1` in a struct `B1` in a module `B` whose ABI should remain stable even if the layout of `A1` changes. We could just `import A;` in `B` and use a pointer to `A1` but suppose we also want to completely isolate users of `B1` from the internals of `A1`, either because of Hyrum's law (even if we make the pointer a private member it may still be observable through reflection or other tricks), because those internals might need to remain secret (e.g closed source libraries), because doing so could provide build isolation for faster incremental builds (`B`'s BMI should not depend on `A`'s BMI), or because in this case `A` is slow to parse and we'd like to lower the rebuild latency for debug builds. We could use PIMPL but the problem is that forward declaring `A1` outside of module `A` is not allowed, and we can't convert `A` into a partition of `B` because we're not allowed to change the file that contains `A`. A proposed `using module A { struct A1; }` statement would allow the forward declaration while making it clear which module `A1` belongs to, and a proposed `import private A;` statement would allow using `A1` and everything else in `A` inside non-inline functions in `B` so that we don't need to repeat the declarations of the members of `B1` in either an implementation unit or a `module :private` section:
 
 ```cpp
 export module B;
 
-import private { // only the following top-level names from A1 will be imported
+import private A; // allow using everything from A in non-inline functions
+
+using module A { // forward declare the following symbols from A to use them in the interface as well
     struct A1; // will be an incomplete type if implicitly exported
     struct A3; // ok while parsing, error during codegen - A does not export A3
-} from A;
-
-struct A1; // error: can't change which module A1 belongs to
+}
 
 export struct B1 {
     A1 * a; // ok
     A1 a_val; // error, this would require A1's definition to be available to the importer
+    A2 * a2; // error, A2 wasn't forward declared
     [[noinline]] B1() { // note: [[noinline]] is a placeholder for having some way to
     // ^ make class members not inline, whether it's via P1779 or some other method
         a = new A1(); // ok
     }
     [[noinline]] void foo() {
-        A2{}; // error, A2 not listed in the import private block
-        A1{}.foo(); // ok, note: we didn't list the member "foo", but it's still ok
+        A1{}.foo(); // ok
+        A2{}.frob(); // ok - wasn't forward declared, still ok
     }
     [[noinline]] void foo(A1 * a) { a->foo(); } // ok
     A1 & get_a() { return *a; } // ok
@@ -52,7 +53,8 @@ export struct B1 {
     template<typename T> void bar(T t) {
         A1 * a1 = a; // ok
         foo(a1); // ok
-        A1{}.foo(); // error, won't work as an incomplete type
+        a1->foo(); // error, won't work as an incomplete type
+        A2 * a2 = nullptr; // error, A2 wasn't forward declared
     }
     auto frob() {
         return A1::secret_value; // error - cannot determine the signature of frob without A1's definition
@@ -78,23 +80,29 @@ void bar() {
 
 A simple implementation of this could choose to compile `big_library` first, then `A`, then `B`, then `C`. A more efficient solution could use two-step compilation where it would e.g extract the interface of `A` in parallel with generating the object file for `big_library`, do the parsing for `B` in parallel with the codegen for `A` etc. Since there are no separate implementation units, in either case for release builds the implementation could choose to include everything in the BMIs for each module, making the entire implementation available for inlining, which could potentially achieve better runtime performance than just LTO, e.g Clang/GCC can do heap elision https://godbolt.org/z/0zgjJF to remove the allocation and indirection overhead of PIMPL.
 
-In many cases parsing should be quite fast compared to codegen, but there will be some situations like module `A` where parsing might be slow as well. With the restrictions shown above on the use of `struct A1` within `B`, forward declaring `struct A1` in the `import private {..}` block should allow extracting `B`'s interface without knowing anything about the the imported module `A`, and so an implementation could choose to extract `B`'s interface in parallel with parsing `big_library` and `A`. The full implementation would no longer be available for inlining but this should further increase parallelism and reduce the rebuild latency for debug builds. In `B`'s BMI `struct A1` would only appear as an incomplete type. The bodies of any functions that use `struct A1`'s defintion would not be included in `B`'s BMI. An implemenation could choose not to include the body of any non-inline functions, making no attempt to parse their bodies, or it could attempt to parse them and not include the ones where that fails due to `struct A1` being odr-used, keeping everything else to improve performance.
+In many cases parsing should be quite fast compared to codegen, but there will be some situations like module `A` where parsing might be slow as well. With the restrictions shown above on the use of `struct A1` within `B`, forward declaring `struct A1` in the `using module A {..}` block should allow extracting `B`'s interface without knowing anything about the imported module `A`, and so an implementation could choose to extract `B`'s interface in parallel with parsing `big_library` and `A`. The full implementation would no longer be available for inlining but this should further increase parallelism and reduce the rebuild latency for debug builds. In `B`'s BMI `struct A1` would only appear as an incomplete type. The bodies of any functions that use `struct A1`'s defintion would not be included in `B`'s BMI. An implementation could choose not to include the body of any non-inline functions, making no attempt to parse their bodies, or it could attempt to parse them and not include the ones where that fails due to `struct A1` being odr-used, keeping everything else to improve performance.
 
 There may still be some overhead in extracting the interface compared to just declaring all of the members and defining them in an implementation unit, but if the code grows large enough for that to be an issue, parts of it should probably be refactored into separate helper classes, which could then be placed in separate modules/paritions and imported privately, thus removing the need to parse most of the implementation while extracting the interface.
 
 ## Example 2 (circular references between modules):
 ```cpp
+export module forwards;
+
+export using module A { struct A; }
+export using module B { string B; }
+```
+
+```cpp
 export module A;
 
-import private {
-    struct B;
-} from B;
+import forwards;
+import private B;
 
 export struct A {
     B * b;
     [[noinline]] A() { b = new B(this); } // ok
     void foo() {}
-    [[noinline]] void bar() { 
+    [[noinline]] void bar() {
         b->foo(); // ok
         b->a->foo(); // ok
     }
@@ -104,15 +112,14 @@ export struct A {
 ```cpp
 export module B;
 
-import private {
-    struct A;
-} from A;
+import forwards;
+import private A;
 
 export struct B {
     A * a;
     B(A * a) : a(a) {}
     void foo() {}
-    [[noinline]] void bar() { 
+    [[noinline]] void bar() {
         a->foo(); // ok
         a->b->foo(); // ok
     }
@@ -166,6 +173,7 @@ namespace AA { export {
 export module AB;
 
 export import A;
+
 using namespace AA;
 export { // adding specializations and deduction guides to A1, to be used by B's impl
     template<> struct A1<int> {};
@@ -176,11 +184,13 @@ export { // adding specializations and deduction guides to A1, to be used by B's
 ```cpp
 export module B;
 
-import private {
+import private AB;
+
+using module AB {
     namespace AA {
         template<typename T> struct A1; // can only be instantiated in a non-inline context
     }
-} from AB;
+}
 
 // cannot add any further specializations / deduction guides here for A1
 
@@ -203,7 +213,7 @@ export {
 }
 ```
 
-## Example 4 (shallow parsing for BMIs):
+## Example 4 (shallow parsing for non-inline functions):
 
 ```cpp
 export module A;
@@ -219,28 +229,20 @@ export {
 
 ```cpp
 export module B;
-```
 
-```cpp
-export module C;
+import private A; // everything in A can be used by non-inline functions and the module :private section/blocks
 
-import private {
-    struct A1;
-    *
-} from A;
-
-import private B;
-
-// everything in A and B can be used by non-inline functions and the module :private section/blocks
-// struct A1 can also be used by the interface as an incomplete pointer
+using module A {
+    struct A1; // this can also be used by the interface as an incomplete pointer
+}
 
 module :private { // optional - could've used something like the AB module from the previous example instead
     // things here can only be used by following non-inline functions and module :private section/blocks
     // so this block can be skipped entirely while extracting the interface
-    // functions/classes whose interface requires the definitions of types in A/B go here:
+    // functions/classes whose interface requires the definitions of types in A go here:
     A1 make_a() { return A1{}; }
     struct B1 { A2::type var = 2; };
-    // specializations and deduction guides for templates in A/B can only be added here:
+    // specializations and deduction guides for templates in A can only be added here:
     ...
 }
 
@@ -257,12 +259,12 @@ export struct B2 {
     A2 * a2; // same - also defined in A
     
     // the following are ok in both cases
-    A1 * a1; // ok - this was named in the import private block
+    A1 * a1; // ok - this was forward declared in the using module block
     void foo(A1 *) {} // same
     
     // the following are errors in both cases
     A1 a1; // error - undeclared identifier / A1's definition must not be accessible to importers
-    A3<int> * a3i; // error - undeclared identifier / not named in the import private block
+    A3<int> * a3i; // error - undeclared identifier / not named in the using module block
     
     [[noinline]] void bar() {
         // the following are ok while extracting the interface, but become errors when creating the object file:
@@ -272,6 +274,7 @@ export struct B2 {
         
         // the following would be errors while extracting the interface, but are ok when creating the object file
         A2::type a2t; // ok - not using the local redefinition which doesn't have a type member
+        int var = B1{}.var; // ok - using B1 from the module :private block
         
         // the following are ok in both cases:
         make_a().foo(); // ok
@@ -286,11 +289,56 @@ export struct B2 {
 };
 
 module :private;
-// can use everything in A,B, and previous module :private blocks
+// can use everything in A and previous module :private blocks
 ```
 
-An issue that comes up with privately importing entire modules (either `import private B;` or `import private { ...; * } from A;`) is that if there is a typo in e.g a function call then, without knowing the list of names from the imported module, the compiler cannot correctly diagnose the typo while extracting the interface. So in order to solve this, some typos could be ignored while extracting the interface, and then diagnosed only later while creating the object file. It may seem strange that the declaration for `D::bar` is successfully added to the BMI despite the errors in its body, but it is no different than declaring it in a header file then having errors in the implementation file.
+An issue that comes up with `import private A;` is that if there is a typo in e.g a function call then, without knowing the list of names from the imported module, the compiler cannot correctly diagnose the typo while extracting the interface. So in order to solve this, some typos need to be ignored while extracting the interface, and then diagnosed only later while creating the object file. This requires shallow parsing (not throwing an error upon encountering undeclared identifiers) all of the non-inline functions in `B`. If the parser finds an undeclared identifier in a non-inline function it could just skip the rest of the function body. It may seem strange that the declaration for `B2::bar` may be successfully added to the BMI despite the errors in its body, but it is no different than declaring it in a header file then having errors in the implementation file. Shallow parsing can lead to possibly incorrect BMIs being emitted, e.g with classes/functions/specializations/deduction guides redefined in the interface but these errors will be caught while creating the object file, so the application won't link with invalid code.
 
-This requires shallow parsing (not throwing an error upon encountering undeclared identifiers) all of the non-inline functions in `D` if there are any private imports of all the names from a module or the entire overload set of a function, but if this is too difficult to implement for some reason, having only private imports of explicitly specified sets of symbols would still be very useful. The implementation could still optimize by including the bodies of functions in the BMI where it does not encounter any undeclared identifiers. Support for omitting template parameters in the import private block also requires shallow parsing of the template arguments i.e accepting any number of template arguments, as long as all of the types/value in the list are known while extracting the interface. Shallow parsing can lead to possibly incorrect BMIs being emitted, e.g with class members having invalid template arguments, or classes/functions/specializations/deduction guides redefined in the interface but these errors will be caught while creating the object file, so the application won't link with invalid code.
+# Example 5 (shallow parsing for incomplete types)
 
-When privately importing an entire module, this proposal doesn't allow the use of any types from the imported module (that were not forward declared in an `import private {...}` block) in the interface, not even as incomplete types. They can only be used inside non-inline functions. Doing otherwise would require shallow parsing not only the non-inline functions, but potentially the entire interface. It's hard to say whether that would work. One possible issue is that if the parser encounters an undeclared identifier `X`, it doesn't know if it's a type or a value, and the difference could actually change the interface https://godbolt.org/z/_b_VjG . On the other hand, many common uses of `X` would not be ambiguous, e.g `struct S { X * x; }` cannot be a multiplication, and in `struct S { std::unique_ptr<X> x; }` there is no overload of `unique_ptr` that accepts a value. So maybe this might be ok ? There's another problem if `import private :part1;` could import both exported and not exported names into the interface as incomplete pointers. If we have `export void foo(X *) {}` then we cannot correctly generate the mangled name of `foo` since `X` might have either module or external linkage. If some solutions could be found to these problems (and possibly more) then perhaps the restriction could be lifted.
+```cpp
+export module A;
+
+import private B, C; // still allows using everything from from B and C in non-inline functions, but here it
+// ^ also allows using types from B and C in the interface as incomplete types without forward declarations
+
+export struct X {
+    Y * y; Z * z; // ok
+    Y y; Z z; // error
+    [[noinline]] void foo(Y *, Z *) { // ok
+        y = new Y; z = new Z; // ok
+    }
+};
+```
+
+```cpp
+export module B;
+
+import private A, C;
+
+export struct Y {
+    X * x; Z * z; // ok
+    X x; Z z; // error
+    [[noinline]] void foo(X *, Z *) { // ok
+        x = new X; z = new Z; // ok
+    }
+};
+```
+
+```cpp
+export module C;
+
+import private A, B;
+
+export struct Z {
+    X * x; Y * y; // ok
+    X x; Y y; // error
+    [[noinline]] void foo(X *, Y*) { // ok
+        x = new X; y = new Y; // ok
+    }
+};
+```
+
+In order to support circular references between modules without requiring forward declarations, a kind of shallow parsing is required not only in non-inline methods, but in the interface as well. E.g while extracting the interface of module `A`, when the parser encounters the undeclared identifier `Y`, privately importing variables/concepts/namespaces/aliases into `A`'s interface (i.e outside of non-inline functions) is not allowed, so there are only two possibilities. Either the code is correct and there exists a type `Y` in one of the modules, or it's a typo, some kind of user error. The parser can proceed assuming it is not a typo, as this assumption will be checked later while creating the object file for `A`. The BMI for `A` will record that `A` exports a method `void X::foo(Y*,Z*)` but the shallow parsing cannot tell which modules `Y` and `Z` are attached to, so it is not possible to generate the full mangled name of `X::foo` using the information in `A`'s BMI alone. But after the BMIs are extracted for `B` and `C` as well, when creating the object file for `A` the sets of symbols that `B` and `C` export will be available to the compiler, so at that point it should be able to find that `B` exports `Y` and `C` exports `Z`, allowing it to write the correct full mangled name for `X::foo` into the object file for `A`.
+
+// TODO: needs more work
